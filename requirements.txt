@@ -1,0 +1,5 @@
+kiteconnect
+selenium
+pyotp
+python-dotenv
+cryptography

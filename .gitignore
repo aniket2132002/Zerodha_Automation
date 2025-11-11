@@ -1,0 +1,33 @@
+# ---- Secrets ----
+.env
+accounts.csv
+tokens/
+*.token
+
+# ---- Logs ----
+logs/
+*.log
+*.png
+
+# ---- Python ----
+__pycache__/
+*.pyc
+
+# ---- Virtual Environment ----
+venv/
+ENV/
+env/
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+
+# ---- WebDriver Manager cache ----
+.wdm/
+*.wdm
+
+# ---- OS files ----
+.DS_Store
+Thumbs.db
+
+.README.md/

@@ -1,0 +1,411 @@
+# Zerodha Multi-Account Automation (Selenium + pyotp) - Demo
+
+**What this package contains**
+- `selenium_multi_login.py` - Main script: reads accounts, logs in with Selenium+TOTP, captures request_token, exchanges for access_token (Kite Connect), saves encrypted token.
+- `token_manager.py` - Helper: encrypt/decrypt access token using Fernet.
+- `notify.py` - Simple email notifier (optional).
+- `requirements.txt` - Python packages required.
+- `.env.example` - Example environment variables you must fill.
+- `accounts.csv.example` - Example CSV for multiple accounts.
+
+**Important security notes**
+- NEVER commit real `.env` or `accounts.csv` with real credentials to public repo.
+- Store `FERNET_KEY` securely (use secret manager in production).
+- This script automates login using user credentials and TOTP secret. Use only for accounts you control and with explicit consent.
+- Prefer Kite Connect API for production workflows where possible.
+
+See comments in `selenium_multi_login.py` for usage and configuration.
+
+"""
+selenium_multi_login.py
+
+"""
+Final Selenium multi-account login script with split TOTP boxes support.
+
+- Auto-manages ChromeDriver using webdriver-manager.
+- Supports single OTP input or split 6-box OTP inputs.
+- Exchanges request_token for access_token using Kite Connect and stores encrypted token via token_manager.save_encrypted_token(client_id, token).
+- Saves screenshots & logs on failure.
+
+Usage:
+1. Ensure .env (API_KEY, API_SECRET, FERNET_KEY) and accounts.csv are present.
+2. Run: python selenium_multi_login.py
+"""
+
+import os
+import csv
+import time
+import logging
+import traceback
+from pathlib import Path
+from urllib.parse import urlparse, parse_qs
+from datetime import datetime
+
+from dotenv import load_dotenv
+import pyotp
+from kiteconnect import KiteConnect
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementNotInteractableException
+
+from token_manager import save_encrypted_token
+from notify import send_email
+
+# ---- Config ----
+load_dotenv()
+API_KEY = os.getenv("API_KEY")
+API_SECRET = os.getenv("API_SECRET")
+
+ACCOUNTS_CSV = os.getenv("ACCOUNTS_CSV", "accounts.csv")
+HEADLESS = os.getenv("HEADLESS", "false").lower() in ("1", "true", "yes")
+LOG_DIR = Path("logs")
+LOG_DIR.mkdir(exist_ok=True)
+
+# ---- Logging ----
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "selenium_multi_login.log"),
+        logging.StreamHandler()
+    ]
+)
+
+# ---- Helpers ----
+def screenshot(driver, name_prefix="error"):
+    ts = int(time.time())
+    path = LOG_DIR / f"{name_prefix}_{ts}.png"
+    try:
+        driver.save_screenshot(str(path))
+        logging.info("Screenshot saved: %s", path)
+    except Exception as e:
+        logging.warning("Failed to save screenshot: %s", e)
+    return path
+
+def build_driver():
+    options = Options()
+    # recommended options
+    options.add_argument("--disable-notifications")
+    options.add_argument("--disable-popup-blocking")
+    options.add_argument("--disable-infobars")
+    options.add_argument("--window-size=1920,1080")
+    # choose headless if configured
+    if HEADLESS:
+        # modern headless mode
+        options.add_argument("--headless=new")
+        options.add_argument("--disable-gpu")
+    # anti-detection tweaks (optional)
+    options.add_experimental_option("excludeSwitches", ["enable-automation"])
+    options.add_experimental_option("useAutomationExtension", False)
+
+    # auto-manage driver
+    service = Service(ChromeDriverManager().install())
+    driver = webdriver.Chrome(service=service, options=options)
+    driver.set_page_load_timeout(60)
+    return driver
+
+def wait_for_request_token(driver, timeout=30):
+    """Wait until current_url contains request_token param and return it."""
+    end = time.time() + timeout
+    while time.time() < end:
+        try:
+            current_url = driver.current_url
+        except Exception:
+            current_url = ""
+        if "request_token=" in current_url:
+            parsed = urlparse(current_url)
+            q = parse_qs(parsed.query)
+            rt = q.get("request_token", [None])[0]
+            status = q.get("status", [None])[0]
+            return rt, status, current_url
+        time.sleep(0.5)
+    return None, None, driver.current_url
+
+def find_otp_fields(driver, timeout=15):
+    """
+    Locate OTP input fields after credential submission.
+    Returns:
+      - list of elements (if split boxes) OR
+      - single element in a list (single box)
+      - or empty list if not found
+    Strategy:
+      - Look for input#totp or input#pin
+      - Look for visible numeric inputs (type=tel/number/password) with maxlength=1 (split boxes)
+      - Look for input with inputmode='numeric' or class containing 'otp' or 'digit'
+    """
+    end = time.time() + timeout
+    while time.time() < end:
+        # 1. direct totp/pin IDs
+        try:
+            el = driver.find_elements(By.ID, "totp")
+            if el:
+                return el
+        except Exception:
+            pass
+        try:
+            el = driver.find_elements(By.ID, "pin")
+            if el:
+                return el
+        except Exception:
+            pass
+
+        # 2. look for grouped split inputs (maxlength=1)
+        try:
+            els = driver.find_elements(By.XPATH, "//input[@maxlength='1' and ( @inputmode='numeric' or contains(@class,'otp') or contains(@class,'digit') )]")
+            els = [e for e in els if e.is_displayed() and e.is_enabled()]
+            if len(els) >= 2:
+                return els
+        except Exception:
+            pass
+
+        # 3. generic numeric inputs visible
+        try:
+            els = driver.find_elements(By.XPATH, "//input[@inputmode='numeric' or @type='tel' or @type='number' or (contains(@class,'otp'))]")
+            els = [e for e in els if e.is_displayed() and e.is_enabled()]
+            if len(els) >= 2:
+                return els
+            if len(els) == 1:
+                return els
+        except Exception:
+            pass
+
+        # 4. fallback: any visible password input on page (could be masked totp)
+        try:
+            els = driver.find_elements(By.XPATH, "//input[@type='password']")
+            els = [e for e in els if e.is_displayed() and e.is_enabled()]
+            if len(els) >= 1:
+                return els
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+    return []
+
+def enter_otp_into_fields(driver, otp, fields):
+    """
+    Fields could be:
+     - multiple single-char inputs -> send one character to each sequentially
+     - single input -> send full otp string
+    """
+    try:
+        if not fields:
+            raise RuntimeError("No OTP fields to enter")
+
+        if len(fields) == 1:
+            fld = fields[0]
+            try:
+                fld.click()
+            except Exception:
+                pass
+            fld.clear()
+            fld.send_keys(otp)
+            return True
+
+        # multiple boxes (split)
+        # ensure focus on first
+        for i, ch in enumerate(otp):
+            if i >= len(fields):
+                break
+            fld = fields[i]
+            # scroll into view and click
+            driver.execute_script("arguments[0].scrollIntoView(true);", fld)
+            try:
+                fld.click()
+            except Exception:
+                pass
+            fld.clear()
+            fld.send_keys(ch)
+            time.sleep(0.05)
+        return True
+    except ElementNotInteractableException as ex:
+        logging.error("ElementNotInteractable while entering OTP: %s", ex)
+        return False
+    except Exception as ex:
+        logging.exception("Unexpected error entering OTP: %s", ex)
+        return False
+
+def click_continue_button(driver, timeout=10):
+    """
+    Try to click the continue / submit button after OTP entry.
+    Looks for visible button with text 'Continue' or generic submit button.
+    """
+    try:
+        wait = WebDriverWait(driver, timeout)
+        # Try exact button text
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[normalize-space()='Continue' or normalize-space()='CONTINUE' or normalize-space()='Continue ']")))
+            btn.click()
+            return True
+        except TimeoutException:
+            pass
+
+        # Try submit buttons
+        try:
+            btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[@type='submit' and (contains(.,'Continue') or contains(.,'Log') or contains(.,'Submit') or contains(.,'Login'))]")))
+            btn.click()
+            return True
+        except TimeoutException:
+            pass
+
+        # last resort: click first clickable button in form area
+        buttons = driver.find_elements(By.XPATH, "//button")
+        for b in buttons:
+            try:
+                if b.is_displayed() and b.is_enabled():
+                    text = (b.text or "").strip()
+                    if text:
+                        b.click()
+                        return True
+            except Exception:
+                continue
+    except Exception as e:
+        logging.exception("Error clicking continue button: %s", e)
+    return False
+
+# ---- Core login flow ----
+def perform_login_for_account(user_id, password, totp_secret):
+    logging.info("Starting login for %s", user_id)
+    driver = None
+    try:
+        driver = build_driver()
+        driver.get("https://kite.zerodha.com/")
+        wait = WebDriverWait(driver, 25)
+
+        # enter user id
+        uid = wait.until(EC.presence_of_element_located((By.ID, "userid")))
+        uid.clear(); uid.send_keys(user_id)
+
+        # password
+        pwd = driver.find_element(By.ID, "password")
+        pwd.clear(); pwd.send_keys(password)
+
+        # submit credentials
+        submit_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
+        submit_btn.click()
+        logging.info("Submitted credentials")
+
+        # small pause to let next screen render
+        time.sleep(1.2)
+
+        # locate OTP fields (this handles split boxes or single input)
+        fields = find_otp_fields(driver, timeout=18)
+        if not fields:
+            logging.error("OTP field not found for %s", user_id)
+            screenshot(driver, f"no_otp_{user_id}")
+            send_email(f"Zerodha OTP not found for {user_id}", f"OTP field not found while automating login for {user_id}. Check screenshot.")
+            return False
+
+        # generate TOTP
+        otp = None
+        try:
+            otp = pyotp.TOTP(totp_secret).now()
+            logging.info("Generated OTP for %s: %s", user_id, otp)
+        except Exception as e:
+            logging.exception("Failed to generate OTP for %s: %s", user_id, e)
+            return False
+
+        # enter OTP into located fields
+        ok = enter_otp_into_fields(driver, otp, fields)
+        if not ok:
+            logging.error("Failed to enter OTP for %s", user_id)
+            screenshot(driver, f"otp_enter_fail_{user_id}")
+            send_email(f"Zerodha OTP entry failed for {user_id}", f"OTP entry failed for {user_id}.")
+            return False
+
+        # click continue
+        clicked = click_continue_button(driver, timeout=8)
+        if not clicked:
+            logging.warning("Continue button not found/clicked for %s, attempting to press Enter", user_id)
+            try:
+                # try to press Enter on last field
+                fields[-1].send_keys("\n")
+            except Exception:
+                pass
+
+        # Wait for redirect or dashboard load
+        rt, status, final_url = wait_for_request_token(driver, timeout=25)
+        if not rt:
+            # maybe the UI didn't redirect to your redirect_url; try to detect successful login by looking for dashboard elements
+            # Example: Kite shows some element with class 'dashboard' or 'kite-logo' - we try a soft check
+            try:
+                # Wait for element that indicates logged-in state (profile circle)
+                WebDriverWait(driver, 8).until(EC.presence_of_element_located((By.XPATH, "//*[contains(@class,'user-id') or contains(text(),'Positions') or contains(@class,'profile')]")))
+                logging.info("Login appears successful for %s (no request_token redirect)", user_id)
+                # NOTE: If you require request_token for API, you may need to ensure redirect url is used in app settings and the login flow triggers it.
+            except Exception:
+                logging.error("request_token not captured and dashboard not detected for %s. URL=%s", user_id, driver.current_url)
+                screenshot(driver, f"no_request_token_{user_id}")
+                send_email(f"Zerodha login failed for {user_id}", f"Request token not captured for {user_id}. URL: {driver.current_url}")
+                return False
+        else:
+            logging.info("Captured request_token for %s (status=%s)", user_id, status)
+            # Exchange request_token for access_token
+            kite = KiteConnect(api_key=API_KEY)
+            data = kite.generate_session(rt, api_secret=API_SECRET)
+            access_token = data.get("access_token")
+            if not access_token:
+                logging.error("generate_session did not return access_token for %s: %s", user_id, data)
+                send_email(f"Zerodha token exchange failed for {user_id}", f"Response: {data}")
+                return False
+            # Save encrypted token using token_manager
+            save_encrypted_token(user_id, access_token)
+            logging.info("Access token saved (encrypted) for %s", user_id)
+            send_email(f"Zerodha token refreshed for {user_id}", f"Access token refreshed and saved for {user_id}")
+
+        return True
+
+    except Exception as e:
+        logging.exception("Error for %s: %s", user_id, e)
+        if driver:
+            screenshot(driver, f"exception_{user_id}")
+        send_email(f"Zerodha automation error for {user_id}", f"Error: {e}\n\n{traceback.format_exc()}")
+        return False
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except Exception:
+                pass
+
+# ---- Main ----
+def read_accounts(file_path=ACCOUNTS_CSV):
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"Accounts CSV not found: {file_path}")
+    rows = []
+    with open(file_path, newline='', encoding='utf-8') as fh:
+        reader = csv.DictReader(fh)
+        for r in reader:
+            uid = r.get("user_id") or r.get("userid") or r.get("user")
+            pwd = r.get("password")
+            totp = r.get("totp_secret") or r.get("totp") or r.get("secret")
+            if not (uid and pwd and totp):
+                logging.warning("Skipping incomplete row: %s", r)
+                continue
+            rows.append((uid.strip(), pwd.strip(), totp.strip()))
+    return rows
+
+def main():
+    if not API_KEY or not API_SECRET:
+        logging.error("API_KEY or API_SECRET missing in environment (.env)")
+        return
+    accounts = read_accounts()
+    logging.info("Loaded %d accounts", len(accounts))
+    for uid, pwd, totp in accounts:
+        try:
+            perform_login_for_account(uid, pwd, totp)
+        except KeyboardInterrupt:
+            logging.info("Interrupted by user")
+            break
+        except Exception:
+            logging.exception("Unhandled exception during processing of %s", uid)
+        # small pause between accounts
+        time.sleep(4)
+
+if __name__ == "__main__":
+    main()
